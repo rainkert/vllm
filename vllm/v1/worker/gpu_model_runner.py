@@ -64,6 +64,8 @@ class GPUModelRunner:
 
         self.is_multimodal_model = model_config.is_multimodal_model
         self.sliding_window = model_config.get_sliding_window()
+        self.sliding_window_layers = model_config.get_sliding_window_layers(
+            parallel_config)
         self.block_size = cache_config.block_size
         self.max_model_len = model_config.max_model_len
         self.max_num_blocks_per_req = cdiv(self.max_model_len, self.block_size)
@@ -76,7 +78,10 @@ class GPUModelRunner:
         self.num_query_heads = model_config.get_num_attention_heads(
             parallel_config)
         self.num_kv_heads = model_config.get_num_kv_heads(parallel_config)
+        self.num_swa_key_value_heads = model_config.get_num_swa_key_value_heads(
+            parallel_config)
         self.head_size = model_config.get_head_size()
+        self.head_size_swa = model_config.get_head_size_swa()
         self.hidden_size = model_config.get_hidden_size()
 
         # Multi-modal data support
@@ -856,9 +861,17 @@ class GPUModelRunner:
         assert len(self.kv_caches) == 0
         kv_cache_shape = FlashAttentionBackend.get_kv_cache_shape(
             num_blocks, self.block_size, self.num_kv_heads, self.head_size)
-        for _ in range(self.num_attn_layers):
+        sliding_window_layers = self.get_sliding_window_layers(
+            self.parallel_config)
+        for layer_idx in range(self.num_attn_layers):
+            cache_shape = kv_cache_shape
+            if (layer_idx in self.sliding_window_layers):
+                cache_shape = FlashAttentionBackend.get_kv_cache_shape(
+                    num_blocks, self.block_size, self.num_swa_key_value_heads,
+                    self.head_size_swa)
+
             self.kv_caches.append(
-                torch.zeros(kv_cache_shape,
+                torch.zeros(cache_shape,
                             dtype=self.kv_cache_dtype,
                             device=self.device))
         bind_kv_cache(

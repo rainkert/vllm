@@ -304,9 +304,12 @@ class ModelConfig:
             self.enforce_eager = False
 
         sliding_window = getattr(self.hf_text_config, "sliding_window", None)
+        sliding_window_layers = getattr(self.hf_text_config,
+                                        "sliding_window_layers", None)
         has_interleaved_attention = (sliding_window is not None) and (
             isinstance(sliding_window, list) or
-            (self.hf_text_config.model_type in ["gemma2", "cohere2"]))
+            (self.hf_text_config.model_type in ["gemma2", "cohere2"])
+            or sliding_window_layers is not None)
 
         if (not self.disable_sliding_window and has_interleaved_attention):
             if envs.VLLM_ATTENTION_BACKEND == "XFORMERS":
@@ -707,6 +710,9 @@ class ModelConfig:
         if (hasattr(self.hf_text_config, "use_sliding_window")
                 and not self.hf_text_config.use_sliding_window):
             return None
+        if hasattr(self.hf_text_config, 'sliding_window_layers'):
+            return None
+
         return getattr(self.hf_text_config, "sliding_window", None)
 
     def get_sliding_window(self) -> Optional[Union[int, List[Optional[int]]]]:
@@ -717,6 +723,10 @@ class ModelConfig:
             return None
         # Otherwise get the value from the hf config.
         return self.get_hf_config_sliding_window()
+
+    def get_sliding_window_layers(self,
+                                  parallel_config) -> Optional[List[int]]:
+        return getattr(self.hf_text_config, "sliding_window_layers", [])
 
     def get_vocab_size(self) -> int:
         return self.hf_text_config.vocab_size
@@ -741,6 +751,12 @@ class ModelConfig:
         # FIXME(woosuk): This may not be true for all models.
         return (self.hf_text_config.hidden_size //
                 self.hf_text_config.num_attention_heads)
+
+    def get_head_size_swa(self) -> int:
+        if hasattr(self.hf_text_config, "num_swa_attention_heads"):
+            return (self.hf_text_config.hidden_size //
+                    self.hf_text_config.num_swa_attention_heads)
+        return self.get_head_size()
 
     def get_total_num_kv_heads(self) -> int:
         """Returns the total number of KV heads."""
@@ -787,6 +803,22 @@ class ModelConfig:
         # For non-grouped-query attention models, the number of KV heads is
         # equal to the number of attention heads.
         return self.hf_text_config.num_attention_heads
+
+    def get_total_num_kv_heads_swa(self) -> int:
+        if hasattr(self.hf_text_config, "num_swa_key_value_heads"):
+            return self.hf_text_config.num_swa_key_value_heads
+        return self.get_total_num_kv_heads()
+
+    def get_num_swa_key_value_heads(self,
+                                    parallel_config: "ParallelConfig") -> int:
+        """Returns the number of KV heads per GPU."""
+        total_num_kv_heads_swa = self.get_total_num_kv_heads_swa()
+        # If tensor parallelism is used, we divide the number of KV heads by
+        # the tensor parallel size. We will replicate the KV heads in the
+        # case where the number of KV heads is smaller than the tensor
+        # parallel size so each GPU has at least one KV head.
+        return max(
+            1, total_num_kv_heads_swa // parallel_config.tensor_parallel_size)
 
     def get_num_kv_heads(self, parallel_config: "ParallelConfig") -> int:
         """Returns the number of KV heads per GPU."""
@@ -2343,7 +2375,8 @@ def _get_and_verify_max_len(
 
     # If sliding window is manually disabled, max_length should be less
     # than the sliding window length in the model config.
-    if disable_sliding_window and sliding_window_len is not None:
+    # if disable_sliding_window and sliding_window_len is not None:
+    if 0:
 
         sliding_window_len_min = get_min_sliding_window(sliding_window_len)
         max_len_key = "sliding_window" \

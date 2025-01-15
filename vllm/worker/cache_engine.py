@@ -33,10 +33,13 @@ class CacheEngine:
         self.device_config = device_config
 
         self.head_size = model_config.get_head_size()
+        self.head_size_swa = model_config.get_head_size_swa()
         # Models like Jamba, have mixed typed layers, E.g Mamba
         self.num_attention_layers = model_config.get_num_layers_by_block_type(
             parallel_config, LayerBlockType.attention)
         self.num_kv_heads = model_config.get_num_kv_heads(parallel_config)
+        self.num_swa_key_value_heads = model_config.get_num_swa_key_value_heads(
+            parallel_config)
 
         self.block_size = cache_config.block_size
         self.num_gpu_blocks = cache_config.num_gpu_blocks
@@ -45,6 +48,8 @@ class CacheEngine:
         self.num_cpu_blocks = cache_config.num_cpu_blocks
         if self.num_cpu_blocks:
             self.num_cpu_blocks //= parallel_config.pipeline_parallel_size
+        self.sliding_window_layers = model_config.get_sliding_window_layers(
+            parallel_config)
 
         if cache_config.cache_dtype == "auto":
             self.dtype = model_config.dtype
@@ -71,14 +76,20 @@ class CacheEngine:
         """Allocates KV cache on the specified device."""
         kv_cache_shape = self.attn_backend.get_kv_cache_shape(
             num_blocks, self.block_size, self.num_kv_heads, self.head_size)
+        kv_cache_shape_swa = self.attn_backend.get_kv_cache_shape(
+            num_blocks, self.block_size, self.num_swa_key_value_heads,
+            self.head_size_swa)
         pin_memory = is_pin_memory_available() if device == "cpu" else False
         kv_cache: List[torch.Tensor] = []
-        for _ in range(self.num_attention_layers):
+        for layer_idx in range(self.num_attention_layers):
             # null block in CpuGpuBlockAllocator requires at least that
             # block to be zeroed-out.
             # We zero-out everything for simplicity.
+            cache_shape = kv_cache_shape
+            if layer_idx in self.sliding_window_layers:
+                cache_shape = kv_cache_shape_swa
             kv_cache.append(
-                torch.zeros(kv_cache_shape,
+                torch.zeros(cache_shape,
                             dtype=self.dtype,
                             pin_memory=pin_memory,
                             device=device))
@@ -107,6 +118,26 @@ class CacheEngine:
         num_heads = model_config.get_num_kv_heads(parallel_config)
         num_attention_layers = model_config.get_num_layers_by_block_type(
             parallel_config, LayerBlockType.attention)
+
+        key_cache_block = cache_config.block_size * num_heads * head_size
+        value_cache_block = key_cache_block
+        total = num_attention_layers * (key_cache_block + value_cache_block)
+        if cache_config.cache_dtype == "auto":
+            dtype = model_config.dtype
+        else:
+            dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+        dtype_size = get_dtype_size(dtype)
+        return dtype_size * total
+
+    @staticmethod
+    def get_cache_block_size_swa(
+        cache_config: CacheConfig,
+        model_config: ModelConfig,
+        parallel_config: ParallelConfig,
+    ) -> int:
+        head_size = model_config.get_head_size_swa()
+        num_heads = model_config.get_num_swa_key_value_heads(parallel_config)
+        num_attention_layers = model_config.get_num_layers(parallel_config)
 
         key_cache_block = cache_config.block_size * num_heads * head_size
         value_cache_block = key_cache_block
