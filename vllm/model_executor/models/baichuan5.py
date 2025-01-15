@@ -187,46 +187,48 @@ class BaiChuanAttention(nn.Module):
         self.last_k = None
         self.last_v = None
 
-    def find_last_seq_idx(self, block_idx: int, ori_idx: int):
-        if self.last_block_tables is None:
-            return ori_idx
-        for i in range(self.last_block_tables.numel() - 1, -1, -1):
-            if self.last_block_tables[i] == block_idx:
-                return i
-        return ori_idx
+    def prefill_set_last_kv(self, k: torch.Tensor, v: torch.Tensor,
+                            last_kv_cache: torch.Tensor,
+                            attn_metadata: AttentionMetadata):
+        batch_size = attn_metadata.num_prefills
+        token_start_idx = 0
+        for seq_idx in range(batch_size):
+            seq_len = attn_metadata.seq_lens[seq_idx]
+            page_idx = attn_metadata.slot_mapping[
+                attn_metadata.seq_start_loc[seq_idx + 1] - 1] // 64
+            last_kv_cache[0][page_idx] = k[:, token_start_idx + seq_len - 1]
+            last_kv_cache[1][page_idx] = v[:, token_start_idx + seq_len - 1]
+            token_start_idx += seq_len
 
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-    ) -> torch.Tensor:
+    def decode_set_last_kv(self, k: torch.Tensor, v: torch.Tensor,
+                           last_kv_cache: torch.Tensor,
+                           attn_metadata: AttentionMetadata):
+        batch_size = attn_metadata.num_decode_tokens
+        for seq_idx in range(batch_size):
+            seq_len = attn_metadata.seq_lens[seq_idx]
+            page_idx = attn_metadata.block_tables[seq_idx][seq_len // 64]
+            last_kv_cache[0][page_idx] = k[:, seq_idx]
+            last_kv_cache[1][page_idx] = v[:, seq_idx]
+
+    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor,
+                kv_cache: torch.Tensor, attn_metadata: AttentionMetadata,
+                last_kv_cache: Optional[torch.Tensor]) -> torch.Tensor:
         qkv, _ = self.W_pack(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         k = k.view(1, -1, self.num_kv_heads, self.head_dim)
         v = v.view(1, -1, self.num_kv_heads, self.head_dim)
         if attn_metadata.num_prefills > 0 and attn_metadata.num_decode_tokens == 0:
             batch_size = attn_metadata.num_prefills
-            self.last_k_p = torch.empty(1,
-                                        batch_size,
-                                        self.num_kv_heads,
-                                        self.head_dim,
-                                        device=k.device,
-                                        dtype=k.dtype)
-            self.last_v_p = torch.empty(1,
-                                        batch_size,
-                                        self.num_kv_heads,
-                                        self.head_dim,
-                                        device=v.device,
-                                        dtype=v.dtype)
+            if kv_cache is not None and kv_cache.numel() != 0:
+                self.prefill_set_last_kv(
+                    k,
+                    v,
+                    last_kv_cache,
+                    attn_metadata,
+                )
             token_start_idx = 0
             for seq_idx in range(batch_size):
                 seq_len = attn_metadata.seq_lens[seq_idx]
-                self.last_k_p[:, seq_idx, :, :] = k[:, token_start_idx +
-                                                    seq_len - 1, :, :]
-                self.last_v_p[:, seq_idx, :, :] = v[:, token_start_idx +
-                                                    seq_len - 1, :, :]
                 k[:, token_start_idx:token_start_idx +
                   seq_len, :, :] = custom_convolution(
                       k[:, token_start_idx:token_start_idx + seq_len, :, :],
@@ -236,12 +238,6 @@ class BaiChuanAttention(nn.Module):
                       v[:, token_start_idx:token_start_idx + seq_len, :, :],
                       self.V)
                 token_start_idx += seq_len
-            self.last_k = torch.cat(
-                (self.last_k, self.last_k_p),
-                dim=1) if self.last_k is not None else self.last_k_p
-            self.last_v = torch.cat(
-                (self.last_v, self.last_v_p),
-                dim=1) if self.last_v is not None else self.last_v_p
 
         elif attn_metadata.num_prefill_tokens == 0 and attn_metadata.num_decode_tokens > 0:
             batch_size = attn_metadata.num_decode_tokens
@@ -249,36 +245,20 @@ class BaiChuanAttention(nn.Module):
             v_temp = v.clone()
             token_idx = 0
             for seq_idx in range(batch_size):
-                last_idx = self.find_last_seq_idx(
-                    attn_metadata.block_tables[seq_idx, 0], seq_idx)
-                k[:, token_idx, :, :] = self.K[
-                    0, 0, :, 0, :1] * self.last_k[:, last_idx, :, :] + self.K[
-                        0, 0, :, 0, 1:] * k[:, token_idx, :, :]
-                v[:, token_idx, :, :] = self.V[
-                    0, 0, :, 0, :1] * self.last_v[:, last_idx, :, :] + self.V[
-                        0, 0, :, 0, 1:] * v[:, token_idx, :, :]
-                token_idx += 1
-            self.last_k = k_temp
-            self.last_v = v_temp
 
-        if attn_metadata.block_tables.numel() != 0:
-            assert (attn_metadata.num_prefill_tokens == 0
-                    and attn_metadata.num_decode_tokens > 0)
-            self.last_block_tables = attn_metadata.block_tables[:, 0].view(-1)
-        else:
-            assert (attn_metadata.num_prefills > 0
-                    and attn_metadata.num_decode_tokens == 0)
-            self.last_block_tables_p = torch.empty(
-                attn_metadata.num_prefills,
-                dtype=attn_metadata.block_tables.dtype,
-                device=attn_metadata.block_tables.device)
-            for seq_idx in range(attn_metadata.num_prefills):
-                page_idx = attn_metadata.slot_mapping[
-                    attn_metadata.seq_start_loc[seq_idx]] // 64
-                self.last_block_tables_p[seq_idx] = page_idx
-            self.last_block_tables = torch.cat(
-                (self.last_block_tables, self.last_block_tables_p), dim=0
-            ) if self.last_block_tables is not None else self.last_block_tables_p
+                seq_len = attn_metadata.seq_lens[seq_idx]
+                page_idx = attn_metadata.block_tables[seq_idx][seq_len // 64]
+                k[:,
+                  token_idx, :, :] = self.K[0, 0, :, 0, :1] * last_kv_cache[0][
+                      page_idx, :, :] + self.K[0, 0, :, 0,
+                                               1:] * k[:, token_idx, :, :]
+                v[:,
+                  token_idx, :, :] = self.V[0, 0, :, 0, :1] * last_kv_cache[1][
+                      page_idx, :, :] + self.V[0, 0, :, 0,
+                                               1:] * v[:, token_idx, :, :]
+                token_idx += 1
+            self.decode_set_last_kv(k_temp, v_temp, last_kv_cache,
+                                    attn_metadata)
 
         k = k.view(-1, self.num_kv_heads * self.head_dim)
         v = v.view(-1, self.num_kv_heads * self.head_dim)
@@ -329,6 +309,7 @@ class BaiChuanDecoderLayer(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
+        last_kv_cache: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
@@ -342,6 +323,7 @@ class BaiChuanDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             kv_cache=kv_cache,
             attn_metadata=attn_metadata,
+            last_kv_cache=last_kv_cache,
         )
 
         # Fully Connected
@@ -393,6 +375,7 @@ class BaiChuanModel(nn.Module):
         self.make_empty_intermediate_tensors = (
             make_empty_intermediate_tensors_factory(
                 ["hidden_states", "residual"], config.hidden_size))
+        self.last_kv_caches = [None] * config.num_hidden_layers
 
     def get_num_heads(self, layer_idx: int):
         if layer_idx in self.config.sliding_window_layers:
@@ -412,6 +395,18 @@ class BaiChuanModel(nn.Module):
         attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors],
     ) -> Union[torch.Tensor, IntermediateTensors]:
+        if kv_caches[0] is not None and kv_caches[0].numel() != 0 and (
+                self.last_kv_caches[0] is None
+                or self.last_kv_caches[0].size(1) != kv_caches[0].size(1)):
+            for i in range(len(kv_caches)):
+                self.last_kv_caches[i] = torch.empty(
+                    kv_caches[i].size(0),
+                    kv_caches[i].size(1),
+                    kv_caches[i].size(3),
+                    kv_caches[i].size(4),
+                    dtype=kv_caches[i].dtype,
+                    device=kv_caches[i].device)
+
         if get_pp_group().is_first_rank:
             hidden_states = self.embed_tokens(input_ids)
             residual = None
@@ -427,6 +422,7 @@ class BaiChuanModel(nn.Module):
                 kv_caches[i],
                 attn_metadata,
                 residual,
+                self.last_kv_caches[i],
             )
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
@@ -476,10 +472,6 @@ class BaiChuanBaseForCausalLM(nn.Module, SupportsLoRA, SupportsPP,
         ".o_proj.",
     ]
     bitsandbytes_stacked_params_mapping = {
-        # shard_name, weight_name, index
-        # "q_proj": ("qkv_proj", 0),
-        # "k_proj": ("qkv_proj", 1),
-        # "v_proj": ("qkv_proj", 2),
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
     }
