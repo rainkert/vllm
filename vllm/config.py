@@ -848,7 +848,7 @@ class ModelConfig:
     def get_num_layers(self, parallel_config: "ParallelConfig") -> int:
         start, end = self.get_layers_start_end_indices(parallel_config)
         return end - start
-
+        
     def get_num_layers_by_block_type(
         self,
         parallel_config: "ParallelConfig",
@@ -862,7 +862,16 @@ class ModelConfig:
 
         if is_transformer:
             # Handle the basic case first
-            return end - start if attn_block_type else 0
+            swa_layers = self.get_sliding_window_layers(parallel_config)
+            num_layers = 0
+            if not swa_layers:
+                num_layers = end - start if attn_block_type else 0
+            else:
+                for layer_id in range(start, end):
+                    if (block_type == LayerBlockType.attention and layer_id not in swa_layers) or \
+                        (block_type == LayerBlockType.swa and layer_id in swa_layers):
+                        num_layers += 1
+            return num_layers 
         elif self.is_attention_free:
             # Attention free
             # Note that this code assumes there

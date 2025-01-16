@@ -211,8 +211,6 @@ class Worker(LocalOrDistributedWorkerBase):
         # Calculate the number of blocks that can be allocated with the
         # profiled peak memory.
         cache_block_size = self.get_cache_block_size_bytes()
-        cache_block_size_swa = self.get_cache_block_size_bytes_swa()
-        cache_block_size = (cache_block_size + cache_block_size_swa) // 2
         if cache_block_size == 0:
             num_gpu_blocks = 0
             num_cpu_blocks = 0
@@ -446,14 +444,6 @@ class Worker(LocalOrDistributedWorkerBase):
         return CacheEngine.get_cache_block_size(self.cache_config,
                                                 self.model_config,
                                                 self.parallel_config)
-
-    def get_cache_block_size_bytes_swa(self) -> int:
-        """Get the size of the KV cache block size in bytes.
-        """
-        return CacheEngine.get_cache_block_size_swa(self.cache_config,
-                                                    self.model_config,
-                                                    self.parallel_config)
-
 
 def init_worker_distributed_environment(
     vllm_config: VllmConfig,

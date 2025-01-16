@@ -37,6 +37,8 @@ class CacheEngine:
         # Models like Jamba, have mixed typed layers, E.g Mamba
         self.num_attention_layers = model_config.get_num_layers_by_block_type(
             parallel_config, LayerBlockType.attention)
+        self.num_attention_layers += model_config.get_num_layers_by_block_type(
+            parallel_config, LayerBlockType.swa)
         self.num_kv_heads = model_config.get_num_kv_heads(parallel_config)
         self.num_swa_key_value_heads = model_config.get_num_swa_key_value_heads(
             parallel_config)
@@ -107,7 +109,7 @@ class CacheEngine:
 
     def copy(self, src_to_dsts: torch.Tensor) -> None:
         self.attn_backend.copy_blocks(self.gpu_cache, src_to_dsts)
-
+    
     @staticmethod
     def get_cache_block_size(
         cache_config: CacheConfig,
@@ -118,30 +120,18 @@ class CacheEngine:
         num_heads = model_config.get_num_kv_heads(parallel_config)
         num_attention_layers = model_config.get_num_layers_by_block_type(
             parallel_config, LayerBlockType.attention)
-
         key_cache_block = cache_config.block_size * num_heads * head_size
         value_cache_block = key_cache_block
         total = num_attention_layers * (key_cache_block + value_cache_block)
-        if cache_config.cache_dtype == "auto":
-            dtype = model_config.dtype
-        else:
-            dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
-        dtype_size = get_dtype_size(dtype)
-        return dtype_size * total
-
-    @staticmethod
-    def get_cache_block_size_swa(
-        cache_config: CacheConfig,
-        model_config: ModelConfig,
-        parallel_config: ParallelConfig,
-    ) -> int:
+        
         head_size = model_config.get_head_size_swa()
         num_heads = model_config.get_num_swa_key_value_heads(parallel_config)
-        num_attention_layers = model_config.get_num_layers(parallel_config)
-
+        swa_num_attention_layers = model_config.get_num_layers_by_block_type(
+            parallel_config, LayerBlockType.swa)
         key_cache_block = cache_config.block_size * num_heads * head_size
         value_cache_block = key_cache_block
-        total = num_attention_layers * (key_cache_block + value_cache_block)
+        total += swa_num_attention_layers * (key_cache_block + value_cache_block)
+        
         if cache_config.cache_dtype == "auto":
             dtype = model_config.dtype
         else:

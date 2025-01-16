@@ -49,7 +49,6 @@ from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers)
 
-from .configuration_baichuan import BaiChuan5Config
 from .interfaces import HasInnerState
 import torch.nn.functional as F
 from torch import nn
@@ -108,7 +107,7 @@ class BaiChuanAttention(nn.Module):
 
     def __init__(
         self,
-        config: BaiChuan5Config,
+        config: PretrainedConfig,
         num_heads: int,
         num_kv_heads: int,
         is_swa: bool,
@@ -271,7 +270,7 @@ class BaiChuanAttention(nn.Module):
 class BaiChuanDecoderLayer(nn.Module):
 
     def __init__(self,
-                 config: BaiChuan5Config,
+                 config: PretrainedConfig,
                  num_heads: int,
                  num_kv_heads: int,
                  is_swa: bool,
