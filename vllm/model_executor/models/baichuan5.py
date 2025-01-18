@@ -201,8 +201,6 @@ class LastKVCacheMannager:
                 index = self.cache_indices_mapping[req_id]
                 self.free_cache_indices.append(index)
                 self.cache_indices_mapping.pop(req_id)
-            else:
-                logger.warning(f'req_id:{req_id}, is not in cache_indices_mapping:{self.cache_indices_mapping}')
        
     def _get_last_kv_indices(self, request_ids_to_seq_ids, finished_requests_ids):
         self._release_finished_requests(finished_requests_ids)
@@ -612,7 +610,6 @@ class BaiChuanModel(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
-cnt = 0
 class BaiChuanBaseForCausalLM(nn.Module, SupportsLoRA, SupportsPP,
                               HasInnerState):
     packed_modules_mapping = {
@@ -746,7 +743,7 @@ class BaiChuanBaseForCausalLM(nn.Module, SupportsLoRA, SupportsPP,
         return self.model.last_kv_cache_manager.get_seqlen_agnostic_capture_inputs(batch_size)
 
 class BaiChuan5ForCausalLM(BaiChuanBaseForCausalLM):
-    """Baichuan5 26B.
+    """
     NOTE: the class name has an upper case 'C'.
     """
 
