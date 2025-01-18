@@ -153,7 +153,7 @@ def decode_smooth(
     )
     return output
     
-    
+
 class LastKVCacheMannager:
     def __init__(
         self, 
@@ -180,13 +180,15 @@ class LastKVCacheMannager:
         assert num_key_value_heads % tensor_model_parallel_world_size == 0
         num_key_value_heads = num_key_value_heads // tensor_model_parallel_world_size
         self.last_kv_caches = []
+        last_kv_size = max_batch_size * 2 # * 2 for cuda graph
+        self.max_batch_size = max_batch_size
         for layer_id in range(num_layers):
             if layer_id in sliding_window_layers:
-                self.last_kv_caches.append(torch.empty(size=(2, max_batch_size, num_swa_key_value_heads, swa_key_value_head_dim),
+                self.last_kv_caches.append(torch.empty(size=(2, last_kv_size, num_swa_key_value_heads, swa_key_value_head_dim),
                                                        dtype=dtype,
                                                        device=device))
             else:
-                self.last_kv_caches.append(torch.empty(size=(2,  max_batch_size, num_key_value_heads, key_value_head_dim),
+                self.last_kv_caches.append(torch.empty(size=(2,  last_kv_size, num_key_value_heads, key_value_head_dim),
                                                        dtype=dtype,
                                                        device=device))
         self.cache_indices_mapping: Dict[str, int] = {}
@@ -201,8 +203,8 @@ class LastKVCacheMannager:
                 self.cache_indices_mapping.pop(req_id)
             else:
                 logger.warning(f'req_id:{req_id}, is not in cache_indices_mapping:{self.cache_indices_mapping}')
-              
-    def get_last_kv_tensors(self, request_ids_to_seq_ids, finished_requests_ids):
+       
+    def _get_last_kv_indices(self, request_ids_to_seq_ids, finished_requests_ids):
         self._release_finished_requests(finished_requests_ids)
         last_kv_indices = [0] * len(request_ids_to_seq_ids)
         for i, (req_id, _) in enumerate(request_ids_to_seq_ids.items()):
@@ -217,8 +219,42 @@ class LastKVCacheMannager:
                 index = self.free_cache_indices.pop()
                 self.cache_indices_mapping[req_id] = index
                 last_kv_indices[i] = index
+        return last_kv_indices
+    
+    def get_last_kv_tensors(self, request_ids_to_seq_ids, finished_requests_ids):
+        last_kv_indices = self._get_last_kv_indices(request_ids_to_seq_ids, finished_requests_ids)
         last_kv_indices = torch.tensor(last_kv_indices, dtype=torch.int32, device=self.device)
         return self.last_kv_caches, last_kv_indices
+    
+    def copy_inputs_before_cuda_graphs(self, input_buffers, **kwargs):
+        """
+        Copy the relevant state_indices into the CUDA graph input buffer 
+        """
+        assert all(
+            key in kwargs
+            for key in ["request_ids_to_seq_ids", "finished_requests_ids"])
+        finished_requests_ids = kwargs["finished_requests_ids"]
+        request_ids_to_seq_ids = kwargs["request_ids_to_seq_ids"]
+        assert "seqlen_agnostic_capture_inputs" in input_buffers
+        _, input_state_indices_buffer = input_buffers[
+            "seqlen_agnostic_capture_inputs"]
+        last_kv_indices = self._get_last_kv_indices(request_ids_to_seq_ids, finished_requests_ids)
+        
+        cuda_graph_pad_len = input_state_indices_buffer.shape[0] - len(last_kv_indices)
+        last_kv_indices.extend(list(range(self.max_batch_size, self.max_batch_size + cuda_graph_pad_len)))
+
+        input_state_indices_buffer.copy_(torch.as_tensor(last_kv_indices, dtype=torch.int32, device=self.device))
+
+    def get_seqlen_agnostic_capture_inputs(self, batch_size: int):
+        """
+        Provide the CUDA graph capture runs with a buffer in adjusted size.
+        The buffer is used to maintain the Baichuan5 Last KV Cache during the CUDA graph
+        replay runs.
+        """
+        state_indices_tensor = torch.as_tensor(list(range(0, batch_size)),
+                                               dtype=torch.int32,
+                                               device=self.device)
+        return (self.last_kv_caches, state_indices_tensor)
 
 class BaiChuanMLP(nn.Module):
 
@@ -542,11 +578,13 @@ class BaiChuanModel(nn.Module):
                 self.config,
             )
         #Ensure kwargs have request_ids_to_seq_ids and finished_requests_ids.
-        request_ids_to_seq_ids = kwargs["request_ids_to_seq_ids"]
-        finished_requests_ids = kwargs["finished_requests_ids"]
-        last_kv_caches, last_kv_indices = self.last_kv_cache_manager.get_last_kv_tensors(request_ids_to_seq_ids, 
-                                                                                         finished_requests_ids,)
-
+        if "seqlen_agnostic_capture_inputs" not in kwargs:
+            request_ids_to_seq_ids = kwargs["request_ids_to_seq_ids"]
+            finished_requests_ids = kwargs["finished_requests_ids"]
+            last_kv_caches, last_kv_indices = self.last_kv_cache_manager.get_last_kv_tensors(request_ids_to_seq_ids, finished_requests_ids,)
+        else:                                                                              
+            last_kv_caches, last_kv_indices = kwargs["seqlen_agnostic_capture_inputs"]
+            
         if get_pp_group().is_first_rank:
             hidden_states = self.embed_tokens(input_ids)
             residual = None
@@ -699,7 +737,13 @@ class BaiChuanBaseForCausalLM(nn.Module, SupportsLoRA, SupportsPP,
                 if "self_attn.K" in name or "self_attn.V" in name:
                     weight_loader = sharded_weight_loader(2)
                 weight_loader(param, loaded_weight)
+    
+    def copy_inputs_before_cuda_graphs(self, input_buffers, **kwargs):
+        return self.model.last_kv_cache_manager.copy_inputs_before_cuda_graphs(
+            input_buffers, **kwargs)
 
+    def get_seqlen_agnostic_capture_inputs(self, batch_size: int):
+        return self.model.last_kv_cache_manager.get_seqlen_agnostic_capture_inputs(batch_size)
 
 class BaiChuan5ForCausalLM(BaiChuanBaseForCausalLM):
     """Baichuan5 26B.
